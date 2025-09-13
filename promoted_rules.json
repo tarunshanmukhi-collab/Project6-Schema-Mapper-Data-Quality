@@ -1,0 +1,29 @@
+{
+  "column_mappings": {
+    "order_id": "order_id",
+    "order_date": "order_date",
+    "customer_id": "customer_id",
+    "customer_name": "customer_name",
+    "email": "email",
+    "phone": "phone",
+    "billing_address": "billing_address",
+    "shipping_address": "shipping_address",
+    "city": "city",
+    "state": "state",
+    "postal_code": "postal_code",
+    "country": "country",
+    "product_sku": "product_sku",
+    "product_name": "product_name",
+    "category": "category",
+    "subcategory": "subcategory",
+    "quantity": "quantity",
+    "unit_price": "unit_price",
+    "currency": "currency",
+    "discount_pct": "discount_pct",
+    "tax_pct": "tax_pct",
+    "shipping_fee": "shipping_fee",
+    "total_amount": "total_amount",
+    "tax_id": "tax_id"
+  },
+  "cleaning_rules": {}
+}
