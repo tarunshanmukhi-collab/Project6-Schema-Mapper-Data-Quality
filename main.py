@@ -852,15 +852,15 @@ def page_targeted_fix():
                     promoted.setdefault("cleaning_rules", {})[col] = rule_name
                 save_promoted(promoted)
                 st.success("Promoted cleaning rules saved.")
-                promoted = load_promoted()
-                st.session_state.promoted = promoted
+                # promoted = load_promoted()
+                st.session_state.promoted = load_promoted()
                 st.rerun()
 
 def page_export():
     st.header("Finalize & Export")
     if "last_cleaned" in st.session_state:
-        st.write("Preview cleaned data (top 20 rows):")
-        st.dataframe(st.session_state.last_cleaned.head(20))
+        st.write("Preview cleaned data:")
+        st.dataframe(st.session_state.last_cleaned)
         csv = st.session_state.last_cleaned.to_csv(index=False).encode("utf-8")
         st.download_button("Download cleaned CSV", data=csv, file_name="cleaned_output.csv", mime="text/csv")
         st.markdown("**Promote column mappings for this partner**")
@@ -871,7 +871,7 @@ def page_export():
                 promoted["column_mappings"][src] = tgt
             save_promoted(promoted)
             st.success("Current mappings promoted. Future uploads with same headers will auto-map.")
-            promoted = load_promoted()
+            # promoted = load_promoted()
             st.rerun()
 
 # # ---------- Build dynamic nav: gate later pages until earlier steps complete ----------
