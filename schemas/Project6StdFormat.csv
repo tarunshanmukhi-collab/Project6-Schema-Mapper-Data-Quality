@@ -1,0 +1,13 @@
+canonical_name
+phone
+billing_address
+shipping_address
+state
+country
+product_sku
+category
+subcategory
+quantity
+shipping_fee
+logistic_fee
+fees_total

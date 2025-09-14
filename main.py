@@ -6,22 +6,83 @@ import re
 from rapidfuzz import process, fuzz
 from datetime import datetime, timezone
 
+# ---------- Schema Management ----------
+SCHEMA_DIR = "schemas"
+os.makedirs(SCHEMA_DIR, exist_ok=True)
+
+def list_schema_files():
+    return [f for f in os.listdir(SCHEMA_DIR) if f.endswith('.csv')]
+
+def load_schema(schema_file):
+    df = pd.read_csv(os.path.join(SCHEMA_DIR, schema_file))
+    return list(df["canonical_name"])
+
+def save_schema(schema_file, fields):
+    df = pd.DataFrame({"canonical_name": fields})
+    df.to_csv(os.path.join(SCHEMA_DIR, schema_file), index=False)
+
+def delete_schema(schema_file):
+    os.remove(os.path.join(SCHEMA_DIR, schema_file))
+
+
 # ---------- Config / Persistence ----------
 PROMOTED_FILE = "promoted_rules.json"
 
-# Load canonical schema from CSV
-CANONICAL_SCHEMA_FILE = "Project6StdFormat.csv"
-if not os.path.exists(CANONICAL_SCHEMA_FILE):
-    st.error(f"Schema file `{CANONICAL_SCHEMA_FILE}` not found. Please provide Project6StdFormat.csv")
-    st.stop()
+# --- Schema Selection and Editing ---
+st.sidebar.header("Schema Management")
+schema_files = list_schema_files()
+if not schema_files:
+    # If no schemas, create a default one from Project6StdFormat.csv if exists
+    if os.path.exists("Project6StdFormat.csv"):
+        df = pd.read_csv("Project6StdFormat.csv")
+        df.to_csv(os.path.join(SCHEMA_DIR, "Project6StdFormat.csv"), index=False)
+        schema_files = ["Project6StdFormat.csv"]
+    else:
+        st.sidebar.warning("No schema files found. Please upload or create one.")
 
-canonical_df = pd.read_csv(CANONICAL_SCHEMA_FILE)
-CANONICAL_SCHEMA = list(canonical_df["canonical_name"])
+selected_schema = st.sidebar.selectbox("Select Canonical Schema", schema_files, index=0 if schema_files else None, key="schema_select")
+
+
+if selected_schema:
+    CANONICAL_SCHEMA_FILE = os.path.join(SCHEMA_DIR, selected_schema)
+    canonical_df = pd.read_csv(CANONICAL_SCHEMA_FILE)
+    CANONICAL_SCHEMA = list(canonical_df["canonical_name"])
+else:
+    CANONICAL_SCHEMA = []
+
+# --- Schema Editor UI ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Edit Canonical Schema")
+if selected_schema:
+    schema_fields = CANONICAL_SCHEMA.copy()
+    st.sidebar.write("Current fields:")
+    for i, field in enumerate(schema_fields):
+        col1, col2 = st.sidebar.columns([4,1])
+        col1.write(field)
+        if col2.button("❌", key=f"del_{field}"):
+            schema_fields.pop(i)
+            save_schema(selected_schema, schema_fields)
+            st.rerun()
+    new_field = st.sidebar.text_input("Add new field", key="add_field")
+    if  new_field:
+        if new_field not in schema_fields:
+            schema_fields.append(new_field)
+            save_schema(selected_schema, schema_fields)
+            st.rerun()
+        else:
+            st.sidebar.warning("Field already exists.")
+    if st.sidebar.button("Delete Schema File"):
+        delete_schema(selected_schema)
+        st.sidebar.success(f"Deleted {selected_schema}")
+        st.rerun()
+
+
 
 # ensure persistence file exists
 if not os.path.exists(PROMOTED_FILE):
     with open(PROMOTED_FILE, "w") as f:
         json.dump({"column_mappings": {}, "cleaning_rules": {}}, f, indent=2)
+
 
 def load_promoted():
     with open(PROMOTED_FILE, "r") as f:
@@ -31,6 +92,28 @@ def save_promoted(data):
     with open(PROMOTED_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+# # --- Custom Cleaner UI ---
+# st.sidebar.markdown("---")
+# st.sidebar.subheader("Custom Cleaning Rules")
+# if CANONICAL_SCHEMA:
+#     custom_col = st.sidebar.selectbox("Column for custom cleaner", CANONICAL_SCHEMA, key="custom_clean_col")
+#     promoted = load_promoted()  # reload in case of changes
+#     custom_cleaners = promoted.get("custom_cleaners", {})
+#     existing_code = custom_cleaners.get(custom_col, "def custom_clean(val):\n    # val is the cell value\n    return val")
+#     custom_code = st.sidebar.text_area("Python function for cleaning (edit as needed)", value=existing_code, height=120, key="custom_clean_code")
+#     if st.sidebar.button("Save Custom Cleaner"):
+#         # Save code
+#         promoted.setdefault("custom_cleaners", {})[custom_col] = custom_code
+#         save_promoted(promoted)
+#         st.sidebar.success(f"Custom cleaner saved for {custom_col}")
+#     if custom_col in custom_cleaners:
+#         if st.sidebar.button("Remove Custom Cleaner"):
+#             promoted["custom_cleaners"].pop(custom_col, None)
+#             save_promoted(promoted)
+#             st.sidebar.success(f"Custom cleaner removed for {custom_col}")
+
+
+# Ensure promoted is loaded before main app logic
 promoted = load_promoted()
 
 # ---------- Utility functions ----------
@@ -310,8 +393,22 @@ def apply_cleaners(df, mapping, cleaning_rules):
     rename_map = {src: tgt for src, tgt in mapping.items() if tgt}
     df = df.rename(columns=rename_map)
     # Clean only canonical columns
+    promoted = load_promoted()
+    custom_cleaners = promoted.get("custom_cleaners", {})
     for col in df.columns:
         cleaner = None
+        # Priority: custom cleaner > promoted rule > default cleaner
+        if col in custom_cleaners:
+            # Dynamically define the function
+            local_vars = {}
+            try:
+                exec(custom_cleaners[col], {}, local_vars)
+                custom_fn = local_vars.get("custom_clean")
+                if custom_fn:
+                    df[col] = df[col].apply(lambda x, fn=custom_fn: fn(x))
+                    continue
+            except Exception as e:
+                st.warning(f"Error in custom cleaner for {col}: {e}")
         if col in cleaning_rules:
             rule = cleaning_rules[col]
             cleaner = DEFAULT_CLEANERS.get(rule, None)
@@ -500,6 +597,12 @@ if uploaded:
         st.markdown("---")
         st.header("Targeted Fix Queue (Leftover Issues)")
         issues = st.session_state.last_issues
+        # --- Download summary report (CSV) ---
+        if issues:
+            import io
+            issues_df = pd.DataFrame(issues)
+            csv_issues = issues_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Issues Report (CSV)", data=csv_issues, file_name="issues_report.csv", mime="text/csv")
         if not issues:
             st.info("No remaining issues found. You're good to go.")
         else:
@@ -564,6 +667,34 @@ if uploaded:
         st.dataframe(st.session_state.last_cleaned.head(20))
         csv = st.session_state.last_cleaned.to_csv(index=False).encode("utf-8")
         st.download_button("Download cleaned CSV", data=csv, file_name="cleaned_output.csv", mime="text/csv")
+
+        # --- PDF Download Button ---
+        from fpdf import FPDF
+        import io
+
+
+        def df_to_pdf(df, title="Cleaned Data"):
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=10)
+            pdf.cell(200, 10, txt=title, ln=True, align="C")
+            col_width = pdf.w / (len(df.columns) + 1)
+            row_height = pdf.font_size * 1.5
+            # Header
+            for col in df.columns:
+                pdf.cell(col_width, row_height, str(col), border=1)
+            pdf.ln(row_height)
+            # Rows (limit to 20 rows for PDF)
+            for i, row in df.head(20).iterrows():
+                for item in row:
+                    pdf.cell(col_width, row_height, str(item), border=1)
+                pdf.ln(row_height)
+            pdf_bytes = pdf.output(dest='S').encode('latin1')
+            return io.BytesIO(pdf_bytes)
+
+        pdf_buffer = df_to_pdf(st.session_state.last_cleaned)
+        st.download_button("Download cleaned PDF", data=pdf_buffer, file_name="cleaned_output.pdf", mime="application/pdf")
+
         st.markdown("**Promote column mappings for this partner**")
         if st.button("Promote current mappings"):
             promoted.setdefault("column_mappings", {})
