@@ -707,7 +707,9 @@ def page_mapping():
         idx = options.index(current_choice) if current_choice in options else 0
         sel = c3.selectbox(
             key=f"map_choice::{r.source_col}",
-            label="", options=options, index=idx,
+            label=f"Your choice for {r.source_col}", 
+            options=options, 
+            index=idx,
             label_visibility="collapsed",
             help="Pick a canonical field or (ignore)."
         )
