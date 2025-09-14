@@ -1,24 +1,29 @@
-import streamlit as st
-import pandas as pd
 import json
 import os
 import re
-from rapidfuzz import process, fuzz
 from datetime import datetime, timezone
+
+import dotenv
+import openai
+import pandas as pd
+import streamlit as st
+import torch
+from dotenv import load_dotenv
+from langchain_huggingface import HuggingFaceEmbeddings
+from numpy import dot
+from numpy.linalg import norm
+from openai import OpenAI
+from rapidfuzz import fuzz
+from sentence_transformers import SentenceTransformer, util
+from transformers import AutoModel, AutoTokenizer
+
+load_dotenv()
 
 # ---------- Config / Persistence ----------
 PROMOTED_FILE = "promoted_rules.json"
-
-# Load canonical schema from CSV
 CANONICAL_SCHEMA_FILE = "Project6StdFormat.csv"
-if not os.path.exists(CANONICAL_SCHEMA_FILE):
-    st.error(f"Schema file `{CANONICAL_SCHEMA_FILE}` not found. Please provide Project6StdFormat.csv")
-    st.stop()
 
-canonical_df = pd.read_csv(CANONICAL_SCHEMA_FILE)
-CANONICAL_SCHEMA = list(canonical_df["canonical_name"])
-
-# ensure persistence file exists
+# Ensure persistence file exists with correct structure
 if not os.path.exists(PROMOTED_FILE):
     with open(PROMOTED_FILE, "w") as f:
         json.dump({"column_mappings": {}, "cleaning_rules": {}}, f, indent=2)
@@ -33,6 +38,18 @@ def save_promoted(data):
 
 promoted = load_promoted()
 
+# Check if canonical schema file exists
+if not os.path.exists(CANONICAL_SCHEMA_FILE):
+    st.error(f"Schema file `{CANONICAL_SCHEMA_FILE}` not found. Please provide <Project6StdFormat.csv> with canonical_name and description columns.")
+    st.stop()
+
+canonical_df = pd.read_csv(CANONICAL_SCHEMA_FILE)
+CANONICAL_SCHEMA = list(canonical_df["canonical_name"])
+CANONICAL_DESCRIPTIONS = dict(zip(
+    canonical_df["canonical_name"],
+    canonical_df["description"] if "description" in canonical_df.columns else [""]*len(canonical_df)
+))
+
 # ---------- Utility functions ----------
 
 def normalize_header(h: str) -> str:
@@ -40,26 +57,89 @@ def normalize_header(h: str) -> str:
     if pd.isna(h):
         return ""
     h = str(h).lower().strip()
-    h = re.sub(r"[_\-\s]+", " ", h)
-    h = re.sub(r"[^\w\s]", "", h)
+    # h = re.sub(r"[_\-\s]+", " ", h)
+    # h = re.sub(r"[^\w\s]", "", h)
     return h
 
 def suggest_mapping(headers, canonical=CANONICAL_SCHEMA, promoted_map=None, top_n=3):
     promoted_map = promoted_map or {}
     suggestions = []
     canon_norm = {c: normalize_header(c) for c in canonical}
-    use_transformers = st.session_state.get("use_transformers", False)
+    sim_method = st.session_state.get("sim_method", "RapidFuzz")
+    use_transformers = (sim_method == "SentenceTransformers")
+    use_hf_tokenizer = (sim_method == "HF AutoTokenizer")
+    use_openai_embeddings = (sim_method == "OpenAI Embeddings")
+    use_hf_embeddings = (sim_method == "HuggingFaceEmbeddings")
+
+    # HuggingFaceEmbeddings
+    if use_hf_embeddings:
+        try:
+            if "hf_embedder" not in st.session_state:
+                st.session_state["hf_embedder"] = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            embedder = st.session_state["hf_embedder"]
+            if "hf_embed_canon" not in st.session_state:
+                canon_texts = list(canon_norm.values())
+                # canon_texts = [f"{c} - {CANONICAL_DESCRIPTIONS.get(c, '')}".strip() for c in canonical]
+                st.session_state["hf_embed_canon"] = embedder.embed_documents(canon_texts)
+            canon_embeds = st.session_state["hf_embed_canon"]
+        except Exception as e:
+            st.warning(f"HuggingFaceEmbeddings error: {e}. Using rapidfuzz fallback.")
+            use_hf_embeddings = False
+
+    # OpenAI Embeddings setup
+    if use_openai_embeddings:
+        try:
+            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            if not client.api_key:
+                st.warning("OpenAI API key not set. Set OPENAI_API_KEY in environment or Streamlit secrets.")
+                use_openai_embeddings = False
+            if "openai_canon_embeds" not in st.session_state:
+                # canon_texts = list(canon_norm.values())
+                canon_texts = [
+                    f"{c} - {CANONICAL_DESCRIPTIONS.get(c, '')}".strip()
+                    for c in canonical
+                ]
+                resp = client.embeddings.create(input=canon_texts, model="text-embedding-ada-002")
+                st.session_state["openai_canon_embeds"] = [e.embedding for e in resp.data]
+        except Exception as e:
+            st.warning(f"OpenAI Embeddings error: {e}. Falling back to rapidfuzz.")
+            use_openai_embeddings = False
+
+    # SentenceTransformers setup
     if use_transformers:
         try:
-            from sentence_transformers import SentenceTransformer, util
-            model = st.session_state.get("st_model")
-            if model is None:
-                model = SentenceTransformer("all-MiniLM-L6-v2")
-                st.session_state["st_model"] = model
-            canon_embeds = model.encode(list(canon_norm.values()), convert_to_tensor=True)
+            if "st_model" not in st.session_state:
+                st.session_state["st_model"] = SentenceTransformer("all-MiniLM-L6-v2")
+            model = st.session_state["st_model"]
+            if "st_canon_embeds" not in st.session_state:
+                canon_texts = list(canon_norm.values())
+                st.session_state["st_canon_embeds"] = model.encode(canon_texts, convert_to_tensor=True)
+            canon_embeds = st.session_state["st_canon_embeds"]
         except Exception as e:
-            st.warning(f"SentenceTransformers not available: {e}. Falling back to rapidfuzz.")
+            st.warning(f"SentenceTransformers error: {e}. Using rapidfuzz fallback.")
             use_transformers = False
+
+    # HF AutoTokenizer setup (dummy example, you should implement get_embedding)
+    if use_hf_tokenizer:
+        try:
+            if "hf_tokenizer" not in st.session_state:
+                st.session_state["hf_tokenizer"] = AutoTokenizer.from_pretrained("bert-base-uncased")
+                st.session_state["hf_model"] = AutoModel.from_pretrained("bert-base-uncased")
+            tokenizer = st.session_state["hf_tokenizer"]
+            hf_model = st.session_state["hf_model"]
+            def get_embedding(text):
+                inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=32)
+                with torch.no_grad():
+                    outputs = hf_model(**inputs)
+                return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+            if "hf_canon_embeds" not in st.session_state:
+                canon_texts = list(canon_norm.values())
+                st.session_state["hf_canon_embeds"] = [get_embedding(t) for t in canon_texts]
+            canon_embeds = st.session_state["hf_canon_embeds"]
+        except Exception as e:
+            st.warning(f"HF AutoTokenizer error: {e}. Using rapidfuzz fallback.")
+            use_hf_tokenizer = False
+
     for h in headers:
         hnorm = normalize_header(h)
         # check promoted (exact or normalized)
@@ -67,7 +147,28 @@ def suggest_mapping(headers, canonical=CANONICAL_SCHEMA, promoted_map=None, top_
             suggestions.append((h, promoted_map["column_mappings"][h], 100.0, "promoted"))
             continue
         candidates = []
-        if use_transformers:
+        if use_hf_embeddings:
+            try:
+                h_embed = embedder.embed_query(hnorm)
+                canon_embeds = st.session_state["hf_embed_canon"]
+                for i, c in enumerate(canonical):
+                    sim = dot(h_embed, canon_embeds[i]) / (norm(h_embed) * norm(canon_embeds[i]))
+                    candidates.append((c, float(sim*100)))
+            except Exception as e:
+                st.warning(f"HuggingFaceEmbeddings error: {e}. Using rapidfuzz fallback.")
+                use_hf_embeddings = False
+        elif use_openai_embeddings:
+            try:
+                resp = client.embeddings.create(input=[hnorm], model="text-embedding-ada-002")
+                h_embed = resp.data[0].embedding
+                canon_embeds = st.session_state["openai_canon_embeds"]
+                for i, c in enumerate(canonical):
+                    sim = dot(h_embed, canon_embeds[i]) / (norm(h_embed) * norm(canon_embeds[i]))
+                    candidates.append((c, float(sim*100)))
+            except Exception as e:
+                st.warning(f"OpenAI Embeddings error: {e}. Using rapidfuzz fallback.")
+                use_openai_embeddings = False
+        elif use_transformers:
             try:
                 h_embed = model.encode(hnorm, convert_to_tensor=True)
                 sims = util.pytorch_cos_sim(h_embed, canon_embeds)[0].cpu().numpy()
@@ -76,13 +177,29 @@ def suggest_mapping(headers, canonical=CANONICAL_SCHEMA, promoted_map=None, top_
             except Exception as e:
                 st.warning(f"SentenceTransformers error: {e}. Using rapidfuzz fallback.")
                 use_transformers = False
-        if not use_transformers:
+        elif use_hf_tokenizer:
+            try:
+                h_embed = get_embedding(hnorm)
+                canon_embeds = st.session_state["hf_canon_embeds"]
+                for i, c in enumerate(canonical):
+                    sim = dot(h_embed, canon_embeds[i]) / (norm(h_embed) * norm(canon_embeds[i]))
+                    candidates.append((c, float(sim*100)))
+            except Exception as e:
+                st.warning(f"HF AutoTokenizer error: {e}. Using rapidfuzz fallback.")
+                use_hf_tokenizer = False
+        if not use_transformers and not use_hf_tokenizer and not use_openai_embeddings and not use_hf_embeddings:
             for c, cnorm in canon_norm.items():
                 score = fuzz.token_sort_ratio(hnorm, cnorm)  # 0-100
                 candidates.append((c, score))
         candidates.sort(key=lambda x: x[1], reverse=True)
+        method_label = (
+            "huggingface_embeddings" if use_hf_embeddings else
+            "openai_embeddings" if use_openai_embeddings else
+            "transformers" if use_transformers else
+            ("hf_tokenizer" if use_hf_tokenizer else "fuzzy")
+        )
         top = candidates[0]
-        suggestions.append((h, top[0], float(top[1]), "transformers" if use_transformers else "fuzzy"))
+        suggestions.append((h, top[0], float(top[1]), method_label))
     return suggestions
 
 # ---------- Deterministic cleaners for canonical fields ----------
@@ -406,9 +523,73 @@ st.sidebar.markdown("""
 # Add toggle for similarity method
 st.sidebar.markdown("---")
 st.sidebar.write("**Similarity Method**")
-sim_method = st.sidebar.radio("Choose mapping similarity method:", ["RapidFuzz", "SentenceTransformers"], index=0, key="sim_method_toggle")
+sim_method = st.sidebar.radio(
+    "Choose mapping similarity method:",
+    [
+        "RapidFuzz",
+        "SentenceTransformers",
+        "HF AutoTokenizer",
+        "OpenAI Embeddings",
+        "HuggingFaceEmbeddings"
+    ],
+    index=0,
+    key="sim_method_toggle"
+)
+st.session_state["sim_method"] = sim_method
 st.session_state["use_transformers"] = (sim_method == "SentenceTransformers")
+st.session_state["use_openai_embeddings"] = (sim_method == "OpenAI Embeddings")
+st.session_state["use_hf_embeddings"] = (sim_method == "HuggingFaceEmbeddings")
+
 uploaded = st.file_uploader("Upload a CSV", type=["csv", "txt"], accept_multiple_files=False)
+
+def verify_openai_key(api_key):
+    try:
+        client = OpenAI(api_key=api_key)
+        client.models.list()
+        return True
+    except Exception:
+        return False
+
+def get_openai_api_key():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if "openai_api_key" in st.session_state:
+        api_key = st.session_state["openai_api_key"]
+    return api_key
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("**OpenAI API Key**")
+    api_key = get_openai_api_key()
+    valid = False
+    reason = ""
+    edit_mode = st.session_state.get("edit_openai_key", False)
+    if api_key and not edit_mode:
+        valid = verify_openai_key(api_key)
+        if valid:
+            st.success("OpenAI API key is set and valid.")
+            if st.button("✏️ Edit API Key", key="openai_edit_btn"):
+                st.session_state["edit_openai_key"] = True
+                st.rerun()
+        else:
+            reason = "The API key provided is invalid or expired."
+            st.warning(
+                f"To use OpenAI Embeddings, you must provide a valid OpenAI API key.\n\n"
+                f"Reason: {reason}\n\n"
+                f"Your key will be securely stored in `.env` for future use."
+            )
+            st.session_state["edit_openai_key"] = True
+            st.rerun()
+    if not api_key or edit_mode:
+        api_key_input = st.text_input("Enter your OpenAI API key", value="", type="password", key="openai_api_key_input")
+        if st.button("Verify & Save API Key", key="openai_save_btn"):
+            if verify_openai_key(api_key_input):
+                st.success("API key is valid and saved.")
+                dotenv.set_key(".env", "OPENAI_API_KEY", api_key_input)
+                st.session_state["openai_api_key"] = api_key_input
+                st.session_state["edit_openai_key"] = False
+                st.rerun()
+            else:
+                st.error("API key is invalid. Please check and try again.")
 
 if uploaded:
     if "last_uploaded_name" not in st.session_state or st.session_state.last_uploaded_name != uploaded.name:
@@ -422,7 +603,22 @@ if uploaded:
     st.header("Schema Mapping Suggestions")
 
     headers = list(df_raw.columns)
+    # Only call suggest_mapping if API key is present for OpenAI Embeddings
+    api_key = get_openai_api_key()
+    if st.session_state["sim_method"] == "OpenAI Embeddings" and not api_key:
+        st.warning("Please enter and verify your OpenAI API key above to use OpenAI Embeddings.")
+        st.stop()
     suggestions = suggest_mapping(headers, CANONICAL_SCHEMA, promoted_map=promoted)
+
+    # Reset user_mapping if sim_method changed or mapping is None
+    if (
+        "user_mapping" not in st.session_state
+        or st.session_state.user_mapping is None
+        or "last_sim_method" not in st.session_state
+        or st.session_state.last_sim_method != st.session_state["sim_method"]
+    ):
+        st.session_state.user_mapping = {s[0]: s[1] for s in suggestions}
+        st.session_state.last_sim_method = st.session_state["sim_method"]
 
     st.write("Suggested mappings (you can override):")
     mapping_cols = {}
@@ -449,7 +645,7 @@ if uploaded:
     targets = [v for v in st.session_state.user_mapping.values() if v]
     dup_targets = {t for t in targets if targets.count(t) > 1}
     if dup_targets:
-        st.warning(f"Multiple source columns mapped to same canonical target: {', '.join(dup_targets)}. This may cause overwriting after rename. Please resolve before continuing.")
+        st.warning(f"Multiple source columns mapped to same canonical target: {', '.join(dup_targets)}")
         st.stop()
 
     st.markdown("---")
