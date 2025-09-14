@@ -9,6 +9,20 @@ from datetime import datetime, timezone
 # ---------- Config / Persistence ----------
 PROMOTED_FILE = "promoted_rules.json"
 
+# --- Simple state bootstrap ---
+if "raw_df" not in st.session_state:
+    st.session_state.raw_df = None 
+if "mapping" not in st.session_state:
+    st.session_state.mapping = {}           # {raw_col -> canonical_col}
+if "cleaned_df" not in st.session_state:
+    st.session_state.cleaned_df = None
+if "dq_report" not in st.session_state:
+    st.session_state.dq_report = {}         # metrics & leftover issues
+if "rules_pack" not in st.session_state:
+    st.session_state.rules_pack = [] 
+if "promoted" not in st.session_state:
+    st.session_state.promoted = None
+
 # Load canonical schema from CSV
 CANONICAL_SCHEMA_FILE = "Project6StdFormat.csv"
 if not os.path.exists(CANONICAL_SCHEMA_FILE):
@@ -408,19 +422,28 @@ st.sidebar.markdown("---")
 st.sidebar.write("**Similarity Method**")
 sim_method = st.sidebar.radio("Choose mapping similarity method:", ["RapidFuzz", "SentenceTransformers"], index=0, key="sim_method_toggle")
 st.session_state["use_transformers"] = (sim_method == "SentenceTransformers")
-uploaded = st.file_uploader("Upload a CSV", type=["csv", "txt"], accept_multiple_files=False)
 
-if uploaded:
-    if "last_uploaded_name" not in st.session_state or st.session_state.last_uploaded_name != uploaded.name:
-        st.session_state.user_mapping = None
-        st.session_state.last_uploaded_name = uploaded.name
-    st.subheader("Preview of uploaded file")
-    df_raw = pd.read_csv(uploaded)
-    st.dataframe(df_raw)
+def page_upload():
+    uploaded = st.file_uploader("Upload a CSV", type=["csv", "txt"], accept_multiple_files=False)
+    if uploaded:
+        if "last_uploaded_name" not in st.session_state or st.session_state.last_uploaded_name != uploaded.name:
+            st.session_state.user_mapping = None
+            st.session_state.last_uploaded_name = uploaded.name
+        st.subheader("Preview of uploaded file")
+        df_raw = pd.read_csv(uploaded)
+        st.session_state.raw_df = df_raw
+        st.dataframe(df_raw)
+        if st.button("Suggest mapping", icon=":material/lightbulb:"):
+            st.rerun()
+    else:
+        st.info("Upload a CSV file to get started. (Only CSVs are supported.)")
+        st.markdown("Example canonical schema used in this demo:")
+        st.write(CANONICAL_SCHEMA)
 
+def page_mapping_():
     st.markdown("---")
     st.header("Schema Mapping Suggestions")
-
+    df_raw = st.session_state.raw_df
     headers = list(df_raw.columns)
     suggestions = suggest_mapping(headers, CANONICAL_SCHEMA, promoted_map=promoted)
 
@@ -451,8 +474,106 @@ if uploaded:
     if dup_targets:
         st.warning(f"Multiple source columns mapped to same canonical target: {', '.join(dup_targets)}. This may cause overwriting after rename. Please resolve before continuing.")
         st.stop()
+    else:
+        st.success("No duplicate target mappings detected.")
+        if st.button("Save mapping", type="primary", icon=":material/save:"):
+            st.session_state.mapping = True
+    # st.session_state.raw_df = df_raw
 
+def page_mapping():
+    import pandas as pd
     st.markdown("---")
+    st.header("Schema Mapping Suggestions")
+
+    df_raw = st.session_state.raw_df
+    headers = list(df_raw.columns)
+
+    # suggestions: iterable of (src, suggested, conf, how)
+    suggestions = suggest_mapping(headers, CANONICAL_SCHEMA, promoted_map=promoted)
+
+    # ---- Build a work DataFrame for the editor ----
+    rows = []
+    for src, suggested, conf, how in suggestions:
+        # Normalize confidence: handle values in [0,1] vs [0,100]
+        if conf is None:
+            conf_norm = 0
+        else:
+            conf_norm = conf * 100 if conf <= 1.0 else conf
+        label = f"{conf_norm:.0f}%"
+        if how == "promoted":
+            label += " (promoted)"
+        rows.append({
+            "source_col": src,
+            "suggested": suggested if suggested else "(ignore)",
+            "confidence": float(conf_norm),
+            "confidence_label": label
+        })
+    work = pd.DataFrame(rows)
+
+    # Initialize or reuse previous mapping
+    if "user_mapping" not in st.session_state or st.session_state.user_mapping is None:
+        st.session_state.user_mapping = {
+            r["source_col"]: (None if r["suggested"] == "(ignore)" else r["suggested"])
+            for _, r in work.iterrows()
+        }
+
+    # Canonical column shown/edited in the grid (defaults to prior selection or suggested)
+    def _init_choice(src, suggested):
+        saved = st.session_state.user_mapping.get(src)
+        return saved if saved is not None else "(ignore)" if suggested == "(ignore)" else suggested
+
+    work["canonical"] = [
+        _init_choice(r.source_col, r.suggested) for r in work.itertuples(index=False)
+    ]
+
+    # Options for the selectbox column
+    options = ["(ignore)"] + list(CANONICAL_SCHEMA)
+
+    edited = st.data_editor(
+        work[["source_col", "suggested", "canonical", "confidence"]],
+        hide_index=True,
+        num_rows="fixed",
+        width='stretch',
+        height=400,
+        column_config={
+            "source_col": st.column_config.TextColumn("Source Column", disabled=True),
+            "suggested": st.column_config.TextColumn("Suggested", disabled=True),
+            "canonical": st.column_config.SelectboxColumn(
+                "Chosen Canonical",
+                options=options
+            ),
+            "confidence": st.column_config.ProgressColumn(
+                "Confidence", min_value=0, max_value=100, format="%.0f%%"
+            ),
+        }
+    )
+
+    # Update session mapping from edits
+    new_map = {}
+    for _, r in edited.iterrows():
+        choice = r["canonical"]
+        new_map[r["source_col"]] = None if choice == "(ignore)" else choice
+    st.session_state.user_mapping = new_map
+
+    # ---- Duplicate target check ----
+    targets = [v for v in new_map.values() if v]
+    dup_targets = {t for t in targets if targets.count(t) > 1}
+    if dup_targets:
+        st.warning(
+            "Multiple source columns mapped to the same canonical target: "
+            + ", ".join(sorted(dup_targets))
+            + ". This may cause overwriting after rename. Please resolve before continuing."
+        )
+        st.stop()
+    else:
+        st.success("No duplicate target mappings detected.")
+        if st.button("Save mapping", type="primary", icon=":material/save:"):
+            # Gate later pages with this flag (as in your existing nav logic)
+            st.session_state.mapping = True
+
+
+def page_clean_validate():
+    df_raw = st.session_state.raw_df
     st.header("One-Click Clean & Validate")
     if st.button("Run Clean & Validate"):
         mapping = {src: tgt for src, tgt in st.session_state.user_mapping.items() if tgt}
@@ -495,7 +616,9 @@ if uploaded:
         after_counts = cleaned.count().to_frame("after_count")
         metrics = before_counts.join(after_counts, how="outer").fillna(0).astype(int)
         st.table(metrics)
+        st.session_state.cleaned_df = cleaned
 
+def page_targeted_fix():
     if "last_issues" in st.session_state:
         st.markdown("---")
         st.header("Targeted Fix Queue (Leftover Issues)")
@@ -555,9 +678,10 @@ if uploaded:
                 save_promoted(promoted)
                 st.success("Promoted cleaning rules saved.")
                 promoted = load_promoted()
+                st.session_state.promoted = promoted
                 st.rerun()
 
-    st.markdown("---")
+def page_export():
     st.header("Finalize & Export")
     if "last_cleaned" in st.session_state:
         st.write("Preview cleaned data (top 20 rows):")
@@ -566,6 +690,7 @@ if uploaded:
         st.download_button("Download cleaned CSV", data=csv, file_name="cleaned_output.csv", mime="text/csv")
         st.markdown("**Promote column mappings for this partner**")
         if st.button("Promote current mappings"):
+            promoted = st.session_state.promoted
             promoted.setdefault("column_mappings", {})
             for src, tgt in st.session_state.last_mapping.items():
                 promoted["column_mappings"][src] = tgt
@@ -574,10 +699,24 @@ if uploaded:
             promoted = load_promoted()
             st.rerun()
 
-else:
-    st.info("Upload a CSV file to get started. (Only CSVs are supported.)")
-    st.markdown("Example canonical schema used in this demo:")
-    st.write(CANONICAL_SCHEMA)
 
+
+
+# # ---------- Build dynamic nav: gate later pages until earlier steps complete ----------
+upload = st.Page(page_upload, title="Upload", icon=":material/upload:")
+mapping = st.Page(page_mapping, title="Mapping", icon=":material/sync_alt:")
+clean   = st.Page(page_clean_validate, title="Clean & Validate", icon=":material/sweep:")
+fixes   = st.Page(page_targeted_fix, title="Targeted Fix", icon=":material/build:")
+export  = st.Page(page_export, title="Report & Export", icon=":material/download:")
+
+pages = [upload]
+if st.session_state.raw_df is not None:
+    pages.append(mapping)
+    pages.append(clean)
+    pages.append(fixes)
+    pages.append(export)
+
+pg = st.navigation(pages, position="top")   # also accepts "sidebar" or "hidden"
 st.markdown("---")
 st.caption(f"App run at {datetime.now(timezone.utc).isoformat()}Z. Mappings & cleaning rules persisted to `{PROMOTED_FILE}`.")
+pg.run()
