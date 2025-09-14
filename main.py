@@ -33,8 +33,8 @@ if "dq_report" not in st.session_state:
     st.session_state.dq_report = {}         # metrics & leftover issues
 if "rules_pack" not in st.session_state:
     st.session_state.rules_pack = [] 
-if "promoted" not in st.session_state:
-    st.session_state.promoted = None
+if "promoted" not in st.session_state or st.session_state.promoted is None:
+    st.session_state.promoted = {}
 
 # Load canonical schema from CSV
 CANONICAL_SCHEMA_FILE = "Project6StdFormat.csv"
@@ -632,152 +632,116 @@ def page_upload():
         st.markdown("Example canonical schema used in this demo:")
         st.write(CANONICAL_SCHEMA)
 
-def page_mapping_():
+def page_mapping():
+    import pandas as pd
+    from collections import defaultdict
+    import streamlit as st
+
     st.markdown("---")
     st.header("Schema Mapping Suggestions")
+
     df_raw = st.session_state.raw_df
     headers = list(df_raw.columns)
-    # Only call suggest_mapping if API key is present for OpenAI Embeddings
-    api_key = get_openai_api_key()
-    if st.session_state["sim_method"] == "OpenAI Embeddings" and not api_key:
-        st.warning("Please enter and verify your OpenAI API key above to use OpenAI Embeddings.")
-        st.stop()
+    sim_method = st.session_state.get("sim_method", "RapidFuzz")
+    signature = (tuple(headers), tuple(CANONICAL_SCHEMA), sim_method)
+
+    # Get suggestions: iterable of (src, suggested, conf, how)
     suggestions = suggest_mapping(headers, CANONICAL_SCHEMA, promoted_map=promoted)
 
-    # Reset user_mapping if sim_method changed or mapping is None
+    # Normalize
+    rows = []
+    for src, suggested, conf, how in suggestions:
+        conf_pct = 0 if conf is None else (conf * 100 if conf <= 1 else conf)
+        rows.append(dict(
+            source_col=src,
+            suggested="(ignore)" if not suggested else suggested,
+            confidence=conf_pct,
+            how=how,
+        ))
+    work = pd.DataFrame(rows)
+
+
     if (
         "user_mapping" not in st.session_state
         or st.session_state.user_mapping is None
-        or "last_sim_method" not in st.session_state
-        or st.session_state.last_sim_method != st.session_state["sim_method"]
+        or st.session_state.get("user_mapping_sig") != signature
     ):
-        st.session_state.user_mapping = {s[0]: s[1] for s in suggestions}
-        st.session_state.last_sim_method = st.session_state["sim_method"]
+        st.session_state.user_mapping = {
+            r.source_col: (None if r.suggested == "(ignore)" else r.suggested)
+            for r in work.itertuples(index=False)
+        }
+        st.session_state.user_mapping_sig = signature
 
     st.write("Suggested mappings (you can override):")
-    mapping_cols = {}
-    cols = st.columns((3, 3, 2, 2))
-    cols[0].markdown("**Source Column**")
-    cols[1].markdown("**Suggested Canonical Field**")
-    cols[2].markdown("**Confidence**")
-    cols[3].markdown("**Override**")
 
-    if "user_mapping" not in st.session_state or st.session_state.user_mapping is None:
-        st.session_state.user_mapping = {s[0]: s[1] for s in suggestions}
+    # Table header row
+    hdr = st.columns(4)
+    hdr[0].markdown("**Source Column**")
+    hdr[1].markdown("**Suggested Canonical Field**")
+    hdr[2].markdown("**Confidence**")
+    hdr[3].markdown("**Your Choice**")
 
-    for src, suggested, conf, how in suggestions:
-        c0, c1, c2, c3 = st.columns((3, 3, 2, 2))
-        c0.write(f"**{src}**")
-        options = ["(ignore)"] + CANONICAL_SCHEMA
-        sel = c1.selectbox(f"map_{src}", options, index=(options.index(st.session_state.user_mapping.get(src)) if st.session_state.user_mapping.get(src) in options else 0), key=f"map_{src}_key")
-        c2.write(f"{conf:.0f}% {'(promoted)' if how=='promoted' else ''}")
-        if sel == "(ignore)":
-            st.session_state.user_mapping[src] = None
-        else:
-            st.session_state.user_mapping[src] = sel
-
-    targets = [v for v in st.session_state.user_mapping.values() if v]
-    dup_targets = {t for t in targets if targets.count(t) > 1}
-    if dup_targets:
-        st.warning(f"Multiple source columns mapped to same canonical target: {', '.join(dup_targets)}")
-        st.stop()
-    else:
-        st.success("No duplicate target mappings detected.")
-        if st.button("Save mapping", type="primary", icon=":material/save:"):
-            st.session_state.mapping = True
-    # st.session_state.raw_df = df_raw
-
-def page_mapping():
-    import pandas as pd
-    st.markdown("---")
-    st.header("Schema Mapping Suggestions")
-
-    df_raw = st.session_state.raw_df
-    headers = list(df_raw.columns)
-
-    # suggestions: iterable of (src, suggested, conf, how)
-    suggestions = suggest_mapping(headers, CANONICAL_SCHEMA, promoted_map=promoted)
-
-    # ---- Build a work DataFrame for the editor ----
-    rows = []
-    for src, suggested, conf, how in suggestions:
-        # Normalize confidence: handle values in [0,1] vs [0,100]
-        if conf is None:
-            conf_norm = 0
-        else:
-            conf_norm = conf * 100 if conf <= 1.0 else conf
-        label = f"{conf_norm:.0f}%"
-        if how == "promoted":
-            label += " (promoted)"
-        rows.append({
-            "source_col": src,
-            "suggested": suggested if suggested else "(ignore)",
-            "confidence": float(conf_norm),
-            "confidence_label": label
-        })
-    work = pd.DataFrame(rows)
-
-    # Initialize or reuse previous mapping
-    if "user_mapping" not in st.session_state or st.session_state.user_mapping is None:
-        st.session_state.user_mapping = {
-            r["source_col"]: (None if r["suggested"] == "(ignore)" else r["suggested"])
-            for _, r in work.iterrows()
-        }
-
-    # Canonical column shown/edited in the grid (defaults to prior selection or suggested)
-    def _init_choice(src, suggested):
-        saved = st.session_state.user_mapping.get(src)
-        return saved if saved is not None else "(ignore)" if suggested == "(ignore)" else suggested
-
-    work["canonical"] = [
-        _init_choice(r.source_col, r.suggested) for r in work.itertuples(index=False)
-    ]
-
-    # Options for the selectbox column
     options = ["(ignore)"] + list(CANONICAL_SCHEMA)
 
-    edited = st.data_editor(
-        work[["source_col", "suggested", "canonical", "confidence"]],
-        hide_index=True,
-        num_rows="fixed",
-        width='stretch',
-        height=400,
-        column_config={
-            "source_col": st.column_config.TextColumn("Source Column", disabled=True),
-            "suggested": st.column_config.TextColumn("Suggested", disabled=True),
-            "canonical": st.column_config.SelectboxColumn(
-                "Chosen Canonical",
-                options=options
-            ),
-            "confidence": st.column_config.ProgressColumn(
-                "Confidence", min_value=0, max_value=100, format="%.0f%%"
-            ),
-        }
-    )
+    # Per-row UI
+    for r in work.itertuples(index=False):
+        c0, c1, c2p,c2c, c3 = st.columns([1,1,1,0.3,1])
 
-    # Update session mapping from edits
-    new_map = {}
-    for _, r in edited.iterrows():
-        choice = r["canonical"]
-        new_map[r["source_col"]] = None if choice == "(ignore)" else choice
-    st.session_state.user_mapping = new_map
+        # Source col
+        c0.markdown(f"**{r.source_col}**")
 
-    # ---- Duplicate target check ----
-    targets = [v for v in new_map.values() if v]
-    dup_targets = {t for t in targets if targets.count(t) > 1}
-    if dup_targets:
-        st.warning(
-            "Multiple source columns mapped to the same canonical target: "
-            + ", ".join(sorted(dup_targets))
-            + ". This may cause overwriting after rename. Please resolve before continuing."
+        # Suggested + badge
+        if r.how == "promoted":
+            with c1:
+                st.write(f"**{r.suggested}**")
+                st.badge("Promoted", icon=":material/star:", color="violet")
+        else:
+            c1.write(r.suggested)
+
+        # Confidence progress bar + label
+        c2p.progress(int(r.confidence))
+        c2c.caption(f"{r.confidence:.0f}%")
+
+        # Override selectbox
+        current_choice = st.session_state.user_mapping.get(r.source_col)
+        idx = options.index(current_choice) if current_choice in options else 0
+        sel = c3.selectbox(
+            key=f"map_choice::{r.source_col}",
+            label="", options=options, index=idx,
+            label_visibility="collapsed",
+            help="Pick a canonical field or (ignore)."
         )
-        st.stop()
+        st.session_state.user_mapping[r.source_col] = None if sel == "(ignore)" else sel
+
+    # Duplicate detection
+    selected = {src: tgt for src, tgt in st.session_state.user_mapping.items() if tgt}
+    inv = defaultdict(list)
+    for src, tgt in selected.items():
+        inv[tgt].append(src)
+
+    dup = {tgt: srcs for tgt, srcs in inv.items() if len(srcs) > 1}
+
+    if dup:
+        dup_text = " ".join([f":orange-badge[⚠️ {tgt}] ({', '.join(srcs)})" for tgt, srcs in dup.items()])
+        st.warning(f"Multiple source columns mapped to the same field: {dup_text}")
     else:
         st.success("No duplicate target mappings detected.")
-        if st.button("Save mapping", type="primary", icon=":material/save:"):
-            # Gate later pages with this flag (as in your existing nav logic)
-            st.session_state.mapping = True
 
+    # Save / Reset
+    ac1, ac2 = st.columns([1, 1])
+    if ac1.button("Save mapping", type="primary", icon=":material/save:"):
+        if dup:
+            st.error("Cannot save while duplicates exist. Please resolve them.")
+        else:
+            st.session_state.mapping = dict(st.session_state.user_mapping)
+            st.success("Mapping saved!")
+
+    if ac2.button("Reset choices", icon=":material/restore:"):
+        for r in work.itertuples(index=False):
+            st.session_state.user_mapping[r.source_col] = (
+                None if r.suggested == "(ignore)" else r.suggested
+            )
+        st.info("Choices reset to suggestions.")
 
 def page_clean_validate():
     df_raw = st.session_state.raw_df
@@ -824,6 +788,8 @@ def page_clean_validate():
         metrics = before_counts.join(after_counts, how="outer").fillna(0).astype(int)
         st.table(metrics)
         st.session_state.cleaned_df = cleaned
+
+    # pages.append(mappingv1)
 
 def page_targeted_fix():
     if "last_issues" in st.session_state:
@@ -905,9 +871,6 @@ def page_export():
             st.success("Current mappings promoted. Future uploads with same headers will auto-map.")
             promoted = load_promoted()
             st.rerun()
-
-
-
 
 # # ---------- Build dynamic nav: gate later pages until earlier steps complete ----------
 upload = st.Page(page_upload, title="Upload", icon=":material/upload:")
