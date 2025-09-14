@@ -5,6 +5,11 @@ import os
 import re
 from rapidfuzz import process, fuzz
 from datetime import datetime, timezone
+from fpdf import FPDF
+import io
+
+# Configure Streamlit as the first Streamlit call (best practice)
+st.set_page_config(page_title="Schema Mapper & Data Quality Fixer", layout="wide")
 
 # ---------- Schema Management ----------
 SCHEMA_DIR = "schemas"
@@ -42,6 +47,13 @@ if not schema_files:
 
 selected_schema = st.sidebar.selectbox("Select Canonical Schema", schema_files, index=0 if schema_files else None, key="schema_select")
 
+# if st.sidebar.button("Upload New Schema CSV"):
+#     uploaded_schema = st.sidebar.file_uploader("Upload Schema CSV", type=["csv"], key="schema_upload")
+#     if uploaded_schema is not None:
+#         with open(os.path.join(SCHEMA_DIR, uploaded_schema.name), "wb") as f:
+#             f.write(uploaded_schema.read())
+#         st.sidebar.success(f"Uploaded {uploaded_schema.name}")
+#         st.rerun()
 
 if selected_schema:
     CANONICAL_SCHEMA_FILE = os.path.join(SCHEMA_DIR, selected_schema)
@@ -64,7 +76,7 @@ if selected_schema:
             save_schema(selected_schema, schema_fields)
             st.rerun()
     new_field = st.sidebar.text_input("Add new field", key="add_field")
-    if  new_field:
+    if new_field:
         if new_field not in schema_fields:
             schema_fields.append(new_field)
             save_schema(selected_schema, schema_fields)
@@ -489,8 +501,6 @@ def validate_df(df):
     return issues
 
 # ---------- Streamlit UI ----------
-
-st.set_page_config(page_title="Schema Mapper & Data Quality Fixer", layout="wide")
 st.title("Schema Mapper & Data Quality Fixer (Map → Clean → Targeted Repair)")
 
 st.sidebar.header("Quick Controls")
@@ -668,9 +678,7 @@ if uploaded:
         csv = st.session_state.last_cleaned.to_csv(index=False).encode("utf-8")
         st.download_button("Download cleaned CSV", data=csv, file_name="cleaned_output.csv", mime="text/csv")
 
-        # --- PDF Download Button ---
-        from fpdf import FPDF
-        import io
+    # --- PDF Download Button ---
 
 
         def df_to_pdf(df, title="Cleaned Data"):
@@ -678,6 +686,12 @@ if uploaded:
             pdf.add_page()
             pdf.set_font("Arial", size=10)
             pdf.cell(200, 10, txt=title, ln=True, align="C")
+            # Guard for empty data to avoid layout issues
+            if df is None or df.empty or len(df.columns) == 0:
+                pdf.ln(10)
+                pdf.cell(200, 10, txt="No data to display.", ln=True, align="C")
+                pdf_bytes = pdf.output(dest='S').encode('latin1', errors='replace')
+                return io.BytesIO(pdf_bytes)
             col_width = pdf.w / (len(df.columns) + 1)
             row_height = pdf.font_size * 1.5
             # Header
@@ -689,7 +703,8 @@ if uploaded:
                 for item in row:
                     pdf.cell(col_width, row_height, str(item), border=1)
                 pdf.ln(row_height)
-            pdf_bytes = pdf.output(dest='S').encode('latin1')
+            # fpdf 1.x requires latin-1; replace unsupported characters gracefully
+            pdf_bytes = pdf.output(dest='S').encode('latin1', errors='replace')
             return io.BytesIO(pdf_bytes)
 
         pdf_buffer = df_to_pdf(st.session_state.last_cleaned)
